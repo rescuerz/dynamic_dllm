@@ -15,6 +15,10 @@ tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_rem
 model = LLaDAModelLM.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, 
                                   torch_dtype=torch.bfloat16).to(device)
 
+# tokenizer = AutoTokenizer.from_pretrained('/home/zhounan/models/models--GSAI-ML--LLaDA-8B-Instruct', trust_remote_code=True)
+# model = LLaDAModelLM.from_pretrained('/home/zhounan/models/models--GSAI-ML--LLaDA-8B-Instruct', trust_remote_code=True, 
+#                                   torch_dtype=torch.bfloat16).to(device)
+
 # Constants
 MASK_TOKEN = "[MASK]"
 MASK_ID = 126336  # The token ID of [MASK] in LLaDA
