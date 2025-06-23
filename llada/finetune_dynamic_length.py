@@ -8,13 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from transformers import AutoTokenizer
-from tqdm import tqdm
 
 # 导入LLaDA模型
 try:
@@ -315,287 +313,6 @@ class DynamicLengthDataset(Dataset):
         }
 
 
-class LLaDADiffusionTrainer:
-    """LLaDA扩散模型动态长度训练器"""
-
-    def __init__(self, model: LLaDAModelLM, tokenizer: AutoTokenizer, config: DynamicLengthConfig):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.config = config
-        self.mask_token_id = len(tokenizer)  # 使用词汇表大小作为mask token ID
-
-        # 获取扩展token的ID
-        self.enlarge_token_ids = {}
-        for key, token in ENLARGE_TOKENS.items():
-            token_id = tokenizer.convert_tokens_to_ids(token)
-            if token_id != tokenizer.unk_token_id:
-                self.enlarge_token_ids[key] = token_id
-
-        logger.info(f"Initialized LLaDA trainer with mask_token_id={self.mask_token_id}")
-        logger.info(f"Enlarge token IDs: {self.enlarge_token_ids}")
-
-    def add_noise(self, input_ids: torch.Tensor, prompt_lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        LLaDA风格的加噪过程
-
-        Args:
-            input_ids: [batch_size, seq_len] 输入token序列
-            prompt_lengths: [batch_size] 每个样本的prompt长度
-
-        Returns:
-            noisy_input: 加噪后的输入
-            mask_ratio: 实际的mask比例
-        """
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
-
-        # 随机采样mask比例，对每个样本独立采样
-        mask_ratios = torch.rand(batch_size, device=device)
-
-        noisy_input = input_ids.clone()
-
-        for i in range(batch_size):
-            prompt_len = prompt_lengths[i].item()
-            response_len = seq_len - prompt_len
-
-            if response_len <= 0:
-                continue
-
-            # 计算需要mask的token数量
-            num_mask = int(response_len * mask_ratios[i].item())
-
-            if num_mask > 0:
-                # 在response部分随机选择位置进行mask
-                response_indices = torch.arange(prompt_len, seq_len, device=device)
-                mask_indices = response_indices[torch.randperm(response_len, device=device)[:num_mask]]
-                noisy_input[i, mask_indices] = self.mask_token_id
-
-        return noisy_input, mask_ratios
-
-    def compute_loss(self, logits: torch.Tensor, targets: torch.Tensor,
-                    mask_positions: torch.Tensor, enlarge_token_positions: torch.Tensor = None) -> torch.Tensor:
-        """
-        计算扩散模型的损失
-
-        Args:
-            logits: [batch_size, seq_len, vocab_size] 模型输出
-            targets: [batch_size, seq_len] 目标token
-            mask_positions: [batch_size, seq_len] mask位置的布尔张量
-            enlarge_token_positions: [batch_size, seq_len] 扩展token位置的布尔张量
-
-        Returns:
-            loss: 计算得到的损失
-        """
-        # 只对mask位置计算损失
-        if mask_positions.any():
-            mask_logits = logits[mask_positions]
-            mask_targets = targets[mask_positions]
-
-            # 基础交叉熵损失
-            loss = F.cross_entropy(mask_logits, mask_targets, reduction='mean')
-
-            # 如果有扩展token位置，给予更高权重
-            if enlarge_token_positions is not None and enlarge_token_positions.any():
-                enlarge_mask_positions = mask_positions & enlarge_token_positions
-                if enlarge_mask_positions.any():
-                    enlarge_logits = logits[enlarge_mask_positions]
-                    enlarge_targets = targets[enlarge_mask_positions]
-                    enlarge_loss = F.cross_entropy(enlarge_logits, enlarge_targets, reduction='mean')
-
-                    # 加权组合损失
-                    loss = 0.7 * loss + 0.3 * self.config.enlarge_loss_weight * enlarge_loss
-        else:
-            loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
-
-        return loss
-
-    def detect_expansion_need(self, logits: torch.Tensor, current_step: int, total_steps: int) -> List[Dict]:
-        """
-        检测是否需要扩展长度
-
-        Args:
-            logits: [batch_size, seq_len, vocab_size] 模型输出
-            current_step: 当前训练步数
-            total_steps: 总训练步数
-
-        Returns:
-            expansion_decisions: 每个样本的扩展决策
-        """
-        batch_size = logits.size(0)
-        progress = current_step / total_steps
-
-        # 只在特定进度区间检测扩展
-        if not (0.4 <= progress <= 0.6):
-            return [{"expand": False, "target_length": None} for _ in range(batch_size)]
-
-        decisions = []
-        for i in range(batch_size):
-            # 检查最后几个位置的token概率
-            last_logits = logits[i, -3:, :]  # 检查最后3个位置
-            probs = F.softmax(last_logits, dim=-1)
-
-            max_prob = 0.0
-            target_length = None
-
-            # 检查扩展token的概率
-            for token_key, token_id in self.enlarge_token_ids.items():
-                if token_key != "enough" and token_id < logits.size(-1):
-                    token_probs = probs[:, token_id]
-                    max_token_prob = token_probs.max().item()
-
-                    if max_token_prob > max_prob and max_token_prob > self.config.confidence_threshold:
-                        max_prob = max_token_prob
-                        if token_key == "enlarge_512":
-                            target_length = 512
-                        elif token_key == "enlarge_1024":
-                            target_length = 1024
-                        elif token_key == "enlarge_2048":
-                            target_length = 2048
-
-            decisions.append({
-                "expand": target_length is not None,
-                "target_length": target_length,
-                "confidence": max_prob
-            })
-
-        return decisions
-
-
-
-
-
-def forward_diffusion_process_with_dynamic_length(input_ids, total_dim=32000, eps=1e-3,
-                                                 current_length=None, special_token_ids=None,
-                                                 timestep=None):
-    """
-    支持动态长度的前向扩散过程
-
-    Args:
-        input_ids: 输入token序列 [batch_size, seq_len]
-        total_dim: 词汇表大小，用作mask token ID
-        eps: 最小mask概率
-        current_length: 当前有效长度（支持动态长度）
-        special_token_ids: 特殊token ID集合
-        timestep: 指定的时间步，如果为None则随机采样
-
-    Returns:
-        tuple: (noisy_input, p_mask, mask_indices, actual_timestep)
-    """
-    b, l = input_ids.shape
-    device = input_ids.device
-
-    # 动态长度处理
-    if current_length is not None:
-        effective_length = min(current_length, l)
-    else:
-        effective_length = l
-
-    # 时间步处理：可以指定或随机采样
-    if timestep is not None:
-        # 使用指定的时间步
-        if isinstance(timestep, (int, float)):
-            t = torch.full((b,), timestep, device=device)
-        else:
-            t = timestep
-    else:
-        # 随机采样时间步
-        t = torch.rand((b,), device=device)
-
-    # 计算mask概率
-    p_mask = (1 - eps) * t + eps
-    p_mask = p_mask[:, None].repeat(1, effective_length)
-
-    # 创建完整的mask概率张量
-    full_p_mask = torch.zeros((b, l), device=device)
-    full_p_mask[:, :effective_length] = p_mask
-
-    # 随机mask（但保护特殊token）
-    mask_indices = torch.rand((b, effective_length), device=device) < p_mask
-
-    # 保护特殊token不被mask
-    if special_token_ids is not None:
-        for token_id in special_token_ids.values():
-            if token_id is not None:
-                special_mask = (input_ids[:, :effective_length] == token_id)
-                mask_indices = mask_indices & (~special_mask)
-
-    # 生成噪声输入
-    noisy_input = input_ids.clone()
-    noisy_input[:, :effective_length] = torch.where(
-        mask_indices,
-        total_dim,  # 使用total_dim作为mask token
-        input_ids[:, :effective_length]
-    )
-
-    return noisy_input, full_p_mask, mask_indices, t
-
-
-def detect_length_expansion_by_decoded_ratio(logits, mask_positions, special_token_ids, current_length=128, total_length=None, detection_ratio=(0.3, 0.4)):
-    """
-    基于已解码token比例检测长度扩展需求
-
-    Args:
-        logits: 模型输出 [batch_size, seq_len, vocab_size]
-        mask_positions: 当前mask位置 [batch_size, seq_len] 布尔张量
-        special_token_ids: 特殊token ID映射
-        current_length: 当前序列长度
-        total_length: 总序列长度（如果为None，使用logits.size(1)）
-        detection_ratio: 检测比例区间，默认(0.3, 0.4)
-
-    Returns:
-        list: 每个样本的扩展决策
-    """
-    batch_size = logits.size(0)
-    if total_length is None:
-        total_length = current_length
-
-    expansion_decisions = []
-    detection_start, detection_end = detection_ratio
-
-    for i in range(batch_size):
-        # 计算已解码token数（非mask的token数）
-        if current_length > 0:
-            current_mask = mask_positions[i, :current_length]
-            decoded_tokens = current_length - current_mask.sum().item()
-            decoded_ratio = decoded_tokens / current_length
-        else:
-            decoded_ratio = 0.0
-
-        # 检查已解码比例是否在检测窗口内（30%-40%）
-        if not (detection_start <= decoded_ratio <= detection_end):
-            expansion_decisions.append({
-                'expand': False,
-                'decoded_ratio': decoded_ratio
-            })
-            continue
-
-        # 在当前长度边界检查是否有enlarge token
-        should_expand = False
-        max_prob = 0.0
-
-        if current_length < logits.size(1):
-            position_logits = logits[i, current_length-1, :]
-            probabilities = torch.softmax(position_logits, dim=-1)
-
-            # 只检查enlarge token的概率
-            enlarge_token_id = special_token_ids.get('enlarge')
-            if enlarge_token_id is not None and enlarge_token_id < logits.size(-1):
-                enlarge_prob = probabilities[enlarge_token_id].item()
-                if enlarge_prob > 0.7:  # 阈值
-                    should_expand = True
-                    max_prob = enlarge_prob
-
-        expansion_decisions.append({
-            'expand': should_expand,
-            'confidence': max_prob,
-            'decoded_ratio': decoded_ratio,
-            'decoded_tokens': decoded_tokens,
-            'current_length': current_length
-        })
-
-    return expansion_decisions
-
-
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='LLaDA扩散模型动态长度微调')
@@ -675,6 +392,394 @@ def setup_model_and_tokenizer(args):
     return model, tokenizer
 
 
+def get_enlarge_token_ids(tokenizer: AutoTokenizer) -> Dict[str, int]:
+    """
+    获取扩展token的ID映射
+
+    Args:
+        tokenizer: 分词器
+
+    Returns:
+        enlarge_token_ids: 扩展token的ID映射字典
+    """
+    enlarge_token_ids = {}
+    for key, token in ENLARGE_TOKENS.items():
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id != tokenizer.unk_token_id:
+            enlarge_token_ids[key] = token_id
+
+    logger.info(f"Enlarge token IDs: {enlarge_token_ids}")
+    return enlarge_token_ids
+
+
+def get_mask_token_id(tokenizer: AutoTokenizer, model=None) -> int:
+    """
+    获取mask token ID，优先级：
+    1. 模型配置中的mask_token_id
+    2. tokenizer的vocab_size（词汇表大小）
+    3. 默认使用词汇表大小
+
+    Args:
+        tokenizer: 分词器
+        model: 模型（可选）
+
+    Returns:
+        mask_token_id: mask token的ID
+    """
+    # 方法1：尝试从模型配置获取
+    if model is not None and hasattr(model, 'config') and hasattr(model.config, 'mask_token_id'):
+        if model.config.mask_token_id is not None:
+            logger.info(f"Using mask_token_id from model config: {model.config.mask_token_id}")
+            return model.config.mask_token_id
+
+    # 方法2：使用tokenizer的词汇表大小
+    mask_token_id = len(tokenizer)
+    logger.info(f"Using tokenizer vocab_size as mask_token_id: {mask_token_id}")
+    return mask_token_id
+
+
+
+
+
+def forward_diffusion_process_with_dynamic_length(input_ids, mask_token_id, eps=1e-3,
+                                                 current_length=None, special_token_ids=None,
+                                                 timestep=None):
+    """
+    支持动态长度的前向扩散过程
+
+    Args:
+        input_ids: 输入token序列 [batch_size, seq_len]
+        mask_token_id: mask token的ID，用于替换被mask的位置
+        eps: 最小mask概率
+        current_length: 当前有效长度（支持动态长度）
+        special_token_ids: 特殊token ID集合
+        timestep: 指定的时间步，如果为None则随机采样
+
+    Returns:
+        tuple: (noisy_input, p_mask, mask_indices, actual_timestep)
+    """
+    b, l = input_ids.shape
+    device = input_ids.device
+
+    # 动态长度处理，从短序列开始，逐步扩展到长序列
+    if current_length is not None:
+        effective_length = min(current_length, l)
+    else:
+        effective_length = l
+
+    # 时间步处理：可以指定或随机采样
+    if timestep is not None:
+        # 使用指定的时间步
+        if isinstance(timestep, (int, float)):
+            t = torch.full((b,), timestep, device=device)
+        else:
+            t = timestep
+    else:
+        # 随机采样时间步
+        t = torch.rand((b,), device=device)
+
+    # 计算mask概率
+    p_mask = (1 - eps) * t + eps
+    p_mask = p_mask[:, None].repeat(1, effective_length)
+
+    # 创建完整的mask概率张量
+    full_p_mask = torch.zeros((b, l), device=device)
+    full_p_mask[:, :effective_length] = p_mask
+
+    # 随机mask（但保护特殊token）
+    mask_indices = torch.rand((b, effective_length), device=device) < p_mask
+
+    # 保护特殊token不被mask
+    if special_token_ids is not None:
+        for token_id in special_token_ids.values():
+            if token_id is not None:
+                special_mask = (input_ids[:, :effective_length] == token_id)
+                mask_indices = mask_indices & (~special_mask)
+
+    # 生成噪声输入
+    noisy_input = input_ids.clone()
+    noisy_input[:, :effective_length] = torch.where(
+        mask_indices,
+        mask_token_id,  # 使用mask_token_id作为mask token
+        input_ids[:, :effective_length]
+    )
+
+    return noisy_input, full_p_mask, mask_indices, t
+
+
+def detect_length_expansion_by_decoded_ratio(logits, mask_positions, special_token_ids, current_length=128,
+                                            prompt_length=None, detection_ratio=(0.3, 0.4)):
+    """
+    基于response部分已解码token比例检测长度扩展需求
+
+    Args:
+        logits: 模型输出 [batch_size, seq_len, vocab_size]
+        mask_positions: 当前mask位置 [batch_size, seq_len] 布尔张量
+        special_token_ids: 特殊token ID映射
+        current_length: 当前序列长度
+        prompt_length: 每个样本的prompt长度 [batch_size] 或单个值
+        detection_ratio: 检测比例区间，默认(0.3, 0.4)
+
+    Returns:
+        list: 每个样本的扩展决策
+    """
+    batch_size = logits.size(0)
+    expansion_decisions = []
+    detection_start, detection_end = detection_ratio
+
+    for i in range(batch_size):
+        # 计算response部分的长度
+        if prompt_length is not None:
+            if isinstance(prompt_length, torch.Tensor):
+                sample_prompt_len = prompt_length[i].item() if len(prompt_length.shape) > 0 else prompt_length.item()
+            else:
+                sample_prompt_len = prompt_length
+            response_length = current_length - sample_prompt_len
+        else:
+            response_length = current_length
+            sample_prompt_len = 0
+
+        response_length = max(1, response_length)  # 确保至少为1
+
+        # 计算response部分已解码token数（非mask的token数）
+        if response_length > 0:
+            # 只考虑response部分的mask情况
+            response_mask = mask_positions[i, sample_prompt_len:current_length]
+            response_decoded_tokens = response_length - response_mask.sum().item()
+            response_decoded_ratio = response_decoded_tokens / response_length
+        else:
+            response_decoded_ratio = 0.0
+            response_decoded_tokens = 0
+
+        # 检查response部分已解码比例是否在检测窗口内（30%-40%）
+        if not (detection_start <= response_decoded_ratio <= detection_end):
+            expansion_decisions.append({
+                'expand': False,
+                'decoded_ratio': response_decoded_ratio,
+                'response_decoded_tokens': response_decoded_tokens,
+                'response_length': response_length
+            })
+            continue
+
+        # 在当前长度边界检查是否有enlarge token
+        should_expand = False
+        max_prob = 0.0
+
+        if current_length < logits.size(1):
+            position_logits = logits[i, current_length-1, :]
+            probabilities = torch.softmax(position_logits, dim=-1)
+
+            # 只检查enlarge token的概率
+            enlarge_token_id = special_token_ids.get('enlarge')
+            if enlarge_token_id is not None and enlarge_token_id < logits.size(-1):
+                enlarge_prob = probabilities[enlarge_token_id].item()
+                if enlarge_prob > 0.7:  # 阈值
+                    should_expand = True
+                    max_prob = enlarge_prob
+
+        expansion_decisions.append({
+            'expand': should_expand,
+            'confidence': max_prob,
+            'decoded_ratio': response_decoded_ratio,
+            'decoded_tokens': response_decoded_tokens,
+            'response_length': response_length,
+            'current_length': current_length
+        })
+
+    return expansion_decisions
+
+
+
+
+def train_dynamic_diffusion_step_multi_expansion(input_ids, prompt_length, model, loss_func,
+                                               special_token_ids, device, config, tokenizer):
+    """
+    支持多次动态扩展的扩散训练
+
+    新的逻辑：
+    1. 从128 tokens开始训练
+    2. 基于已解码token比例（30%-40%）检测扩展需求
+    3. 支持多次扩展：128→256→512→1024→2048→4096
+    4. 每次扩展都对完整序列重新进行扩散训练
+    """
+    # 动态获取mask token ID
+    mask_token_id = get_mask_token_id(tokenizer, model)
+    initial_length = config.initial_length  # 从配置中获取初始长度
+    max_expansions = config.max_expansions  # 从配置中获取最大扩展次数
+
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    expansion_count = 0
+    current_length = initial_length
+
+    # 多次扩展循环 - 用于最大扩展次数限制
+    for expansion_round in range(max_expansions):
+        # 确保当前长度不超过输入序列长度
+        if current_length >= input_ids.size(1):
+            break
+
+        # 1. 当前长度的扩散训练
+        current_input = input_ids[:, :current_length]
+
+        # 强制在检测窗口内进行加噪训练
+        # 关键修正：只对response部分进行加噪，确保逻辑一致性
+        batch_size = current_input.shape[0]
+
+        # 计算每个样本的response长度
+        response_lengths = []
+        for i in range(batch_size):
+            response_length = current_length - prompt_length[i].item()
+            response_lengths.append(max(1, response_length))  # 确保至少为1
+
+        # 在检测区间内随机选择目标解码比例，增加训练多样性
+        detection_min = config.expansion_check_ratio - 0.05  # 例如：0.30
+        detection_max = config.expansion_check_ratio + 0.05  # 例如：0.40
+        target_decoded_ratio = torch.rand(1).item() * (detection_max - detection_min) + detection_min
+
+        # 基于response部分计算目标mask数量
+        target_response_decoded_tokens = int(max(response_lengths) * target_decoded_ratio)
+        target_response_mask_tokens = max(response_lengths) - target_response_decoded_tokens
+
+        # 计算response部分的mask比例
+        response_mask_ratio = target_response_mask_tokens / max(response_lengths)
+
+        # 计算对应的时间步，确保response部分mask比例符合检测窗口要求
+        eps = 1e-3
+        target_timestep = max(0.0, min(1.0, (response_mask_ratio - eps) / (1 - eps)))
+
+        logger.debug(f"Response-only masking: response_len={max(response_lengths)}, "
+                    f"target_decoded_ratio={target_decoded_ratio:.3f}, "
+                    f"response_mask_tokens={target_response_mask_tokens}")
+
+        # 只对response部分应用扩散过程
+        noisy_input = current_input.clone()
+
+        # 为每个样本单独处理response部分
+        for i in range(batch_size):
+            prompt_len = prompt_length[i].item()
+            response_len = response_lengths[i]
+
+            if response_len > 0:
+                # 提取response部分
+                response_part = current_input[i, prompt_len:prompt_len + response_len].unsqueeze(0)
+
+                # 对response部分应用扩散
+                noisy_response, _, _, _ = forward_diffusion_process_with_dynamic_length(
+                    response_part, mask_token_id=mask_token_id,
+                    current_length=response_len, special_token_ids=special_token_ids,
+                    timestep=target_timestep
+                )
+
+                # 将加噪后的response部分放回完整序列
+                noisy_input[i, prompt_len:prompt_len + response_len] = noisy_response[0]
+
+        # 创建完整的p_mask张量
+        p_mask = torch.zeros_like(noisy_input, dtype=torch.float)
+        for i in range(batch_size):
+            prompt_len = prompt_length[i].item()
+            response_len = response_lengths[i]
+            if response_len > 0:
+                # 只有response部分有mask概率
+                response_mask_prob = (1 - eps) * target_timestep + eps
+                p_mask[i, prompt_len:prompt_len + response_len] = response_mask_prob
+
+        # 记录实际被mask的位置
+        actual_mask_indices = (noisy_input == mask_token_id)
+
+        # 模型前向传播
+        outputs = model(input_ids=noisy_input)
+        logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+
+        # 计算当前长度的损失
+        if actual_mask_indices.any():
+            current_loss = loss_func(logits[actual_mask_indices], current_input[actual_mask_indices], reduction='none') / p_mask[actual_mask_indices]
+            current_loss = current_loss.sum() / (current_input.shape[0] * current_length - prompt_length.sum())
+        else:
+            current_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+        # 累加损失
+        total_loss = total_loss + current_loss
+
+        # 2. 强化动态扩展窗口能力 - 现在每次都在检测窗口内训练
+        # 基于response部分进行扩展检测，逻辑更加一致
+        expansion_decisions = detect_length_expansion_by_decoded_ratio(
+            logits, mask_positions=actual_mask_indices,
+            special_token_ids=special_token_ids, current_length=current_length,
+            prompt_length=prompt_length,  # 传入prompt长度信息
+            detection_ratio=(config.expansion_check_ratio - 0.05, config.expansion_check_ratio + 0.05)
+        )
+
+        # 3. 处理扩展决策 - 根据enough/enlarge决策控制循环
+        should_expand = False
+        expansion_decision_made = False
+
+        # 检查扩展决策
+        for decision in expansion_decisions:
+            expansion_decision_made = True
+            if decision['expand']:
+                should_expand = True
+                expansion_count += 1
+                logger.debug(f"Expansion round {expansion_round + 1}: enlarge token detected, expanding...")
+                break
+            else:
+                logger.debug(f"Expansion round {expansion_round + 1}: enough token detected, stopping expansion")
+                break
+
+        # 如果检测到enough，结束所有后续循环
+        if expansion_decision_made and not should_expand:
+            logger.debug("Training complete: model indicates content is sufficient (enough)")
+            break
+
+        # 如果需要扩展，按照预定义步骤扩展到下一个长度
+        if should_expand:
+            # 找到下一个扩展长度
+            expansion_steps = config.expansion_steps
+            next_length = current_length
+            for step in expansion_steps:
+                if step > current_length and step <= input_ids.size(1):
+                    next_length = step
+                    break
+
+            if next_length > current_length:
+                current_length = next_length
+                logger.debug(f"Expansion round {expansion_round + 1}: extending to {current_length} tokens")
+            else:
+                # 没有更大的扩展步骤，结束循环
+                logger.debug("Training complete: reached maximum possible length")
+                break
+
+    # 4. 按照实际扩展次数进行损失归一化
+    actual_rounds = expansion_round + 1  # 实际执行的轮数
+    if actual_rounds > 1:
+        # 按实际训练轮数进行平均
+        total_loss = total_loss / actual_rounds
+        logger.debug(f"Loss normalized by {actual_rounds} actual training rounds")
+
+    logger.debug(f"Training summary: {actual_rounds} rounds, {expansion_count} expansions, final_length={current_length}")
+    return total_loss
+
+def save_checkpoint(model, tokenizer, optimizer, scheduler, step, output_dir, is_final=False):
+    """保存检查点"""
+    if is_final:
+        checkpoint_dir = output_dir / "final_model"
+    else:
+        checkpoint_dir = output_dir / f"checkpoint-{step}"
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # 保存模型和tokenizer
+    model.save_pretrained(checkpoint_dir)
+    tokenizer.save_pretrained(checkpoint_dir)
+
+    # 保存训练状态
+    torch.save({
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'step': step,
+    }, checkpoint_dir / "training_state.pt")
+
+    logger.info(f"Saved checkpoint to {checkpoint_dir}")
+
+
 def train_dynamic_length_sft(args):
     """主训练函数"""
     # 设置随机种子
@@ -713,8 +818,8 @@ def train_dynamic_length_sft(args):
         confidence_threshold=0.7
     )
 
-    # 创建训练器
-    trainer = LLaDADiffusionTrainer(model, tokenizer, config)
+    # 获取扩展token的ID映射
+    enlarge_token_ids = get_enlarge_token_ids(tokenizer)
 
     # 创建数据集
     logger.info("Loading dataset...")
@@ -852,9 +957,10 @@ def train_dynamic_length_sft(args):
                 prompt_length=batch["prompt_lengths"],
                 model=model,
                 loss_func=torch.nn.functional.cross_entropy,
-                special_token_ids=trainer.enlarge_token_ids,
+                special_token_ids=enlarge_token_ids,
                 device=device,
-                config=config
+                config=config,
+                tokenizer=tokenizer
             )
 
             # 反向传播
@@ -892,32 +998,6 @@ def train_dynamic_length_sft(args):
     logger.info("Training completed!")
 
 
-
-
-
-def save_checkpoint(model, tokenizer, optimizer, scheduler, step, output_dir, is_final=False):
-    """保存检查点"""
-    if is_final:
-        checkpoint_dir = output_dir / "final_model"
-    else:
-        checkpoint_dir = output_dir / f"checkpoint-{step}"
-
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    # 保存模型和tokenizer
-    model.save_pretrained(checkpoint_dir)
-    tokenizer.save_pretrained(checkpoint_dir)
-
-    # 保存训练状态
-    torch.save({
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'step': step,
-    }, checkpoint_dir / "training_state.pt")
-
-    logger.info(f"Saved checkpoint to {checkpoint_dir}")
-
-
 def main():
     """主函数"""
     args = parse_args()
@@ -938,113 +1018,6 @@ def main():
     train_dynamic_length_sft(args)
 
 
-def train_dynamic_diffusion_step_multi_expansion(input_ids, prompt_length, model, loss_func,
-                                               special_token_ids, device, config):
-    """
-    支持多次动态扩展的扩散训练
-
-    新的逻辑：
-    1. 从128 tokens开始训练
-    2. 基于已解码token比例（30%-40%）检测扩展需求
-    3. 支持多次扩展：128→256→512→1024→2048→4096
-    4. 每次扩展都对完整序列重新进行扩散训练
-    """
-    total_dim = 32000  # 词汇表大小
-    initial_length = config.initial_length  # 从配置中获取初始长度
-    max_expansions = config.max_expansions  # 从配置中获取最大扩展次数
-
-    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
-    expansion_count = 0
-    current_length = initial_length
-
-    # 多次扩展循环
-    for expansion_round in range(max_expansions):
-        # 确保当前长度不超过输入序列长度
-        if current_length >= input_ids.size(1):
-            break
-
-        # 1. 当前长度的扩散训练
-        current_input = input_ids[:, :current_length]
-
-        # 应用扩散过程
-        noisy_input, p_mask, _, _ = forward_diffusion_process_with_dynamic_length(
-            current_input, total_dim=total_dim, current_length=current_length,
-            special_token_ids=special_token_ids
-        )
-
-        # 创建位置索引，保护prompt部分
-        temp_tensor = torch.arange(noisy_input.size(1), device=device).expand(noisy_input.size(0), noisy_input.size(1))
-        prompt_index = (temp_tensor < prompt_length.unsqueeze(1))
-
-        # 保持prompt部分不被mask
-        noisy_input[prompt_index] = current_input[prompt_index].clone()
-
-        # 记录实际被mask的位置
-        actual_mask_indices = (noisy_input == total_dim)
-
-        # 模型前向传播
-        outputs = model(input_ids=noisy_input)
-        logits = outputs.logits if hasattr(outputs, 'logits') else outputs
-
-        # 计算当前长度的损失
-        if actual_mask_indices.any():
-            current_loss = loss_func(logits[actual_mask_indices], current_input[actual_mask_indices], reduction='none') / p_mask[actual_mask_indices]
-            current_loss = current_loss.sum() / (current_input.shape[0] * current_length - prompt_length.sum())
-        else:
-            current_loss = torch.tensor(0.0, device=device, requires_grad=True)
-
-        # 累加损失
-        total_loss = total_loss + current_loss
-
-        # 2. 检测是否需要扩展（基于已解码token比例）
-        detection_ratio = (config.expansion_check_ratio - 0.05, config.expansion_check_ratio + 0.05)  # 基于config计算检测区间
-        expansion_decisions = detect_length_expansion_by_decoded_ratio(
-            logits, mask_positions=actual_mask_indices,
-            special_token_ids=special_token_ids, current_length=current_length,
-            detection_ratio=detection_ratio
-        )
-
-        # 3. 处理扩展决策
-        should_expand = False
-
-        # 检查是否有任何样本需要扩展
-        for decision in expansion_decisions:
-            if decision['expand']:
-                should_expand = True
-                expansion_count += 1
-                break
-
-        # 如果需要扩展，按照预定义步骤扩展到下一个长度
-        if should_expand:
-            # 找到下一个扩展长度
-            expansion_steps = config.expansion_steps
-            next_length = current_length
-            for step in expansion_steps:
-                if step > current_length and step <= input_ids.size(1):
-                    next_length = step
-                    break
-
-            if next_length > current_length:
-                current_length = next_length
-                logger.debug(f"Expansion round {expansion_round + 1}: extending to {current_length} tokens")
-            else:
-                # 没有更大的扩展步骤，结束循环
-                break
-        else:
-            # 没有扩展需求，结束循环
-            break
-
-    # 4. 返回平均损失
-    if expansion_count > 0:
-        # 如果有扩展，对损失进行平均
-        total_loss = total_loss / (expansion_round + 1)
-
-    return total_loss
-
-
-
-
-
 if __name__ == "__main__":
     main()
 
@@ -1056,14 +1029,10 @@ if __name__ == "__main__":
 #     --output_dir ./output/llada_dynamic \
 #     --batch_size 1 \
 #     --learning_rate 5e-6 \
-#     --max_steps 1000 \
-#     --gradient_accumulation_steps 8 \
+#     --max_steps 1 \
+#     --gradient_accumulation_steps 1 \
 #     --save_steps 500 \
 #     --logging_steps 100 \
-#     --max_length 2048
+#     --max_length 2048 \
+#     --num_epochs 1 \
 #
-# 特殊token说明：
-# - <enlarge>: 通用扩展token，表示需要扩展长度
-# - <enough>: 结束token，表示当前长度已足够
-#
-# 多次扩展流程：128→256→512→1024→2048→4096
