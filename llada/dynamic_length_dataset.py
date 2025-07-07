@@ -148,26 +148,29 @@ class DynamicLengthDataset(Dataset):
         在关键位置插入enlarge token
 
         策略：在64/128/256/512/1024等关键位置插入<enlarge>token
+        注意：位置是1基索引，需要转换为0基索引进行插入
+        直接在token级别操作，避免空格导致的位置偏移
         """
-        enlarge_token_text = SPECIAL_TOKENS['enlarge']
+        # 获取enlarge token的ID
+        enlarge_token_id = self.tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS['enlarge'])
 
-        # 定义关键位置
+        # 定义关键位置（1基索引）
         key_positions = [64, 128, 256, 512, 1024, 2048]
 
-        # 找到需要插入的位置（小于当前长度的最大位置）
-        insert_positions = [pos for pos in key_positions if pos < response_length]
+        # 转换为0基索引，并找到需要插入的位置
+        insert_positions = [pos - 1 for pos in key_positions if pos <= response_length]
+
+        # 复制原始token列表
+        modified_tokens = response_tokens.copy()
 
         # 从后往前插入，避免位置偏移
-        modified_response = response
         for pos in reversed(insert_positions):
-            if pos < len(response_tokens):
-                # 在指定位置插入enlarge token
-                first_part = self.tokenizer.decode(response_tokens[:pos], skip_special_tokens=False)
-                second_part = self.tokenizer.decode(response_tokens[pos:], skip_special_tokens=False)
-                modified_response = first_part + ' ' + enlarge_token_text + ' ' + second_part
+            if pos < len(modified_tokens):
+                # 直接在token列表中插入enlarge token ID
+                modified_tokens.insert(pos, enlarge_token_id)
 
-                # 更新response_tokens以便下次插入
-                response_tokens = self.tokenizer.encode(modified_response, add_special_tokens=False)
+        # 将修改后的token列表解码为文本
+        modified_response = self.tokenizer.decode(modified_tokens, skip_special_tokens=False)
 
         return modified_response
 
@@ -326,7 +329,7 @@ def test_dataset_processing():
         # 初始化tokenizer（使用一个轻量级的tokenizer进行测试）
         print("正在加载tokenizer...")
         tokenizer = AutoTokenizer.from_pretrained(
-            "microsoft/DialoGPT-medium",  # 使用较小的模型进行测试
+            "GSAI-ML/LLaDA-8B-Instruct",  # 使用较小的模型进行测试
             padding_side="right",
             use_fast=True
         )
@@ -344,6 +347,8 @@ def test_dataset_processing():
         # 设置pad token
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        print(f"pad token: {tokenizer.pad_token}")
+        print(f"eos token: {tokenizer.eos_token}")
 
         # 创建配置
         config = DynamicLengthConfig()
@@ -367,17 +372,28 @@ def test_dataset_processing():
         print(f"  总样本数: {stats['total_samples']}")
         print(f"  扩展token分布: {stats['enlarge_token_distribution']}")
 
-        # 显示长度分布的前10个
-        length_dist = stats['length_distribution']
-        sorted_lengths = sorted(length_dist.items(), key=lambda x: x[1], reverse=True)[:10]
-        print(f"  长度分布 (前10个):")
-        for length, count in sorted_lengths:
-            print(f"    {length} tokens: {count} 个样本")
+
+        # 获取特殊token的ID
+        enlarge_token_id = tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS["enlarge"])
+        enough_token_id = tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS["enough"])
+        special_token_ids = [enlarge_token_id, enough_token_id]
+
+        print(f"\n特殊Token ID映射:")
+        print(f"  {SPECIAL_TOKENS['enlarge']} -> ID: {enlarge_token_id}")
+        print(f"  {SPECIAL_TOKENS['enough']} -> ID: {enough_token_id}")
 
         # 显示几个样本示例
         print(f"\n样本示例:")
-        for i in range(min(3, len(dataset))):
+        for i in range(min(10, len(dataset))):
             sample = dataset[i]
+            response = sample['response']
+            response_tokens = tokenizer.encode(response, add_special_tokens=False)
+            response_length = len(response_tokens)
+
+            # 寻找special token的位置
+            enlarge_positions = [idx for idx, token_id in enumerate(response_tokens) if token_id == enlarge_token_id]
+            enough_positions = [idx for idx, token_id in enumerate(response_tokens) if token_id == enough_token_id]
+
             print(f"\n样本 {i+1}:")
             print(f"  Prompt: {sample['prompt']}")
             print(f"  Response: {sample['response']}")
@@ -386,6 +402,32 @@ def test_dataset_processing():
             print(f"  扩展Token: {sample['enlarge_token']}")
             print(f"  长度类别: {sample['length_category']}")
             print(f"  Input IDs长度: {len(sample['input_ids'])}")
+            print(f"  Response token数量: {len(response_tokens)}")
+            print(f"  <enlarge> token位置: {enlarge_positions}")
+            print(f"  <enough> token位置: {enough_positions}")
+
+            # 验证特殊token是否在预期位置
+            if sample['enlarge_token'] == 'enlarge' and enlarge_positions:
+                original_length = sample['response_length']
+                key_positions = [64, 128, 256, 512, 1024, 2048]
+                expected_original_positions = [pos - 1 for pos in key_positions if pos <= original_length]
+
+                # 计算考虑偏移的预期位置
+                expected_modified_positions = []
+                offset = 0
+                for pos in expected_original_positions:
+                    adjusted_pos = pos + offset
+                    expected_modified_positions.append(adjusted_pos)
+                    offset += 1
+
+                print(f"  预期<enlarge>位置: {expected_modified_positions}")
+
+                if enlarge_positions == expected_modified_positions:
+                    print(f"  ✅ 位置完全匹配!")
+                else:
+                    print(f"  ⚠️  位置不匹配")
+            elif sample['enlarge_token'] == 'enough' and enough_positions:
+                print(f"  ✅ <enough> token在末尾位置")
 
         print(f"\n✓ 数据集处理测试完成！")
         print(f"处理后的数据已保存到: {test_file.replace('.jsonl', '_processed.jsonl')}")

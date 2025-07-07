@@ -2,7 +2,7 @@ import json
 import tempfile
 import os
 from transformers import AutoTokenizer
-from finetune_dynamic_length import DynamicLengthDataset, DynamicLengthConfig, ENLARGE_TOKENS
+from dynamic_length_dataset import DynamicLengthDataset, DynamicLengthConfig, SPECIAL_TOKENS
 
 test_list = [1, 3, 5, 7, 9]
 
@@ -25,7 +25,7 @@ def test_dataset_creation():
         )
         
         # 添加特殊tokens
-        special_tokens = list(ENLARGE_TOKENS.values())
+        special_tokens = list(SPECIAL_TOKENS.values())
         existing_tokens = set(tokenizer.get_vocab().keys())
         new_tokens = [token for token in special_tokens if token not in existing_tokens]
         
@@ -74,7 +74,7 @@ def test_special_token_insertion(dataset, tokenizer):
             print(f"修改后回答token数: {len(modified_tokens)}")
             
             # 检查特殊token是否正确插入
-            enlarge_token_id = tokenizer.convert_tokens_to_ids(ENLARGE_TOKENS[example['enlarge_token']])
+            enlarge_token_id = tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS[example['enlarge_token']])
             if enlarge_token_id in modified_tokens:
                 positions = [j for j, token_id in enumerate(modified_tokens) if token_id == enlarge_token_id]
                 print(f"特殊token位置: {positions}")
@@ -86,12 +86,12 @@ def test_special_token_insertion(dataset, tokenizer):
             print(f"修改后回答: {example['response']}")
             
             # 验证逻辑
-            if example['response_length'] <= 128:
+            if example['response_length'] <= 64:
                 assert example['enlarge_token'] == 'enough', f"短回答应该使用enough token，但使用了{example['enlarge_token']}"
-                assert example['response'].endswith(ENLARGE_TOKENS['enough']), "短回答应该在末尾添加enough token"
+                assert example['response'].endswith(SPECIAL_TOKENS['enough']), "短回答应该在末尾添加enough token"
             else:
                 assert example['enlarge_token'] == 'enlarge', f"长回答应该使用enlarge token，但使用了{example['enlarge_token']}"
-                assert ENLARGE_TOKENS['enlarge'] in example['response'], "长回答应该包含enlarge token"
+                assert SPECIAL_TOKENS['enlarge'] in example['response'], "长回答应该包含enlarge token"
 
 def test_dataset_getitem(dataset, tokenizer):
     """测试数据集的__getitem__方法"""
