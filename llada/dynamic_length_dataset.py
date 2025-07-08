@@ -33,6 +33,7 @@ class DynamicLengthConfig:
     confidence_threshold: float = 0.7
     expansion_check_ratio: float = 0.35  # 在30%-40%已解码token比例时检查扩展
     max_expansions: int = 5  # 最大扩展次数
+    exclude_special_tokens_from_attention: bool = False  # 是否将special token排除在注意力机制之外
 
     def __post_init__(self):
         if self.expansion_steps is None:
@@ -52,6 +53,7 @@ class DynamicLengthDataset(Dataset):
         self.config = config
         self.enlarge_token_ids = self._get_enlarge_token_ids()
         self.examples = []
+        self._log_special_token_exclusion = False  # 控制是否记录special token排除日志
 
         logger.info(f"Loading data from {data_path}")
         self._load_and_process_data(data_path)
@@ -125,7 +127,7 @@ class DynamicLengthDataset(Dataset):
                 enlarge_token = "enough"
                 modified_response = response + ' ' + SPECIAL_TOKENS["enough"]
             else:
-                # 长回答：在适当位置插入enlarge token
+                # 长回答：只在适当位置插入enlarge token，末尾不添加enough token
                 enlarge_token = "enlarge"
                 modified_response = self._insert_enlarge_token_at_positions(response, response_tokens, response_length)
 
@@ -147,27 +149,33 @@ class DynamicLengthDataset(Dataset):
         """
         在关键位置插入enlarge token
 
-        策略：在64/128/256/512/1024等关键位置插入<enlarge>token
-        注意：位置是1基索引，需要转换为0基索引进行插入
+        目标：确保<enlarge> token最终位于下标63、127、255、511、1023等位置
+        策略：从前往后插入，每次插入时计算正确的插入位置，确保最终位置准确
         直接在token级别操作，避免空格导致的位置偏移
         """
         # 获取enlarge token的ID
         enlarge_token_id = self.tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS['enlarge'])
 
-        # 定义关键位置（1基索引）
-        key_positions = [64, 128, 256, 512, 1024, 2048]
-
-        # 转换为0基索引，并找到需要插入的位置
-        insert_positions = [pos - 1 for pos in key_positions if pos <= response_length]
+        # 定义目标最终位置（0基索引）
+        target_final_positions = [63, 127, 255, 511, 1023, 2047]  # 对应64、128、256、512、1024、2048位置
 
         # 复制原始token列表
         modified_tokens = response_tokens.copy()
 
-        # 从后往前插入，避免位置偏移
-        for pos in reversed(insert_positions):
-            if pos < len(modified_tokens):
-                # 直接在token列表中插入enlarge token ID
-                modified_tokens.insert(pos, enlarge_token_id)
+        # 从前往后插入，确保每个<enlarge> token最终位于正确位置
+        for final_pos in target_final_positions:
+            # 检查原始长度是否足够长，需要插入这个位置的token
+            if final_pos < response_length:
+                # 直接在目标最终位置插入
+                # 由于我们从前往后插入，当前的final_pos就是我们要插入的位置
+                insert_pos = final_pos
+
+                # 确保插入位置在有效范围内
+                if insert_pos >= 0 and insert_pos < len(modified_tokens):
+                    # 在计算出的位置插入enlarge token ID
+                    modified_tokens.insert(insert_pos, enlarge_token_id)
+
+                    logger.debug(f"Inserted <enlarge> at index {insert_pos}, final position will be {final_pos}")
 
         # 将修改后的token列表解码为文本
         modified_response = self.tokenizer.decode(modified_tokens, skip_special_tokens=False)
@@ -227,6 +235,10 @@ class DynamicLengthDataset(Dataset):
 
         return stats
 
+    def enable_special_token_logging(self, enable: bool = True):
+        """启用或禁用special token排除的日志记录"""
+        self._log_special_token_exclusion = enable
+
     def __len__(self) -> int:
         """返回数据集大小"""
         return len(self.examples)
@@ -251,7 +263,7 @@ class DynamicLengthDataset(Dataset):
         )
 
         input_ids = encoding['input_ids']
-        attention_mask = encoding['attention_mask']
+        attention_mask = encoding['attention_mask'].copy()
 
         # 计算prompt长度
         prompt_encoding = self.tokenizer(
@@ -262,6 +274,19 @@ class DynamicLengthDataset(Dataset):
             return_tensors=None
         )
         prompt_length = len(prompt_encoding['input_ids'])
+
+        # 修改attention_mask：根据配置决定是否将special token排除在注意力机制之外
+        if self.config.exclude_special_tokens_from_attention:
+            special_token_count = 0
+            for i, token_id in enumerate(input_ids):
+                if token_id in self.enlarge_token_ids.values():
+                    attention_mask[i] = 0  # special token不参与注意力计算
+                    special_token_count += 1
+
+            if special_token_count > 0:
+                # 只在有special token时记录日志，避免过多输出
+                if hasattr(self, '_log_special_token_exclusion') and self._log_special_token_exclusion:
+                    print(f"Dataset: Excluded {special_token_count} special tokens from attention mask")
 
         # 创建labels（只对response部分计算损失）
         labels = input_ids.copy()
@@ -409,20 +434,16 @@ def test_dataset_processing():
             # 验证特殊token是否在预期位置
             if sample['enlarge_token'] == 'enlarge' and enlarge_positions:
                 original_length = sample['response_length']
-                key_positions = [64, 128, 256, 512, 1024, 2048]
-                expected_original_positions = [pos - 1 for pos in key_positions if pos <= original_length]
+                target_final_positions = [63, 127, 255, 511, 1023, 2047]  # 期望的最终位置（0基索引）
 
-                # 计算考虑偏移的预期位置
-                expected_modified_positions = []
-                offset = 0
-                for pos in expected_original_positions:
-                    adjusted_pos = pos + offset
-                    expected_modified_positions.append(adjusted_pos)
-                    offset += 1
+                # 找到应该插入的最终位置
+                expected_final_positions = [pos for pos in target_final_positions if pos < original_length]
 
-                print(f"  预期<enlarge>位置: {expected_modified_positions}")
+                print(f"  原始长度: {original_length}")
+                print(f"  预期<enlarge>最终位置: {expected_final_positions}")
+                print(f"  实际<enlarge>位置: {enlarge_positions}")
 
-                if enlarge_positions == expected_modified_positions:
+                if enlarge_positions == expected_final_positions:
                     print(f"  ✅ 位置完全匹配!")
                 else:
                     print(f"  ⚠️  位置不匹配")
@@ -438,71 +459,6 @@ def test_dataset_processing():
         traceback.print_exc()
 
 
-def analyze_gsm8k_data():
-    """分析GSM8K数据的特征"""
-    import json
-    import os
-
-    print("=" * 60)
-    print("分析 GSM8K 数据特征")
-    print("=" * 60)
-
-    # 从llada目录向上查找dataset目录
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    parent_dir = os.path.dirname(current_dir)
-    dataset_dir = os.path.join(parent_dir, "dataset")
-
-    files_to_analyze = ["gsm8k_train.jsonl", "gsm8k_test.jsonl"]
-
-    for filename in files_to_analyze:
-        file_path = os.path.join(dataset_dir, filename)
-        if not os.path.exists(file_path):
-            print(f"跳过不存在的文件: {file_path}")
-            continue
-
-        print(f"\n分析文件: {filename}")
-        print("-" * 40)
-
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = []
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        data.append(json.loads(line))
-
-            print(f"总样本数: {len(data)}")
-
-            # 分析问题和答案长度
-            question_lengths = []
-            answer_lengths = []
-
-            for item in data[:100]:  # 只分析前100个样本
-                question = item.get('question', '')
-                answer = item.get('answer', '')
-
-                question_lengths.append(len(question))
-                answer_lengths.append(len(answer))
-
-            print(f"问题长度统计 (前100个样本):")
-            print(f"  平均长度: {sum(question_lengths)/len(question_lengths):.1f} 字符")
-            print(f"  最短: {min(question_lengths)} 字符")
-            print(f"  最长: {max(question_lengths)} 字符")
-
-            print(f"答案长度统计 (前100个样本):")
-            print(f"  平均长度: {sum(answer_lengths)/len(answer_lengths):.1f} 字符")
-            print(f"  最短: {min(answer_lengths)} 字符")
-            print(f"  最长: {max(answer_lengths)} 字符")
-
-            # 显示几个示例
-            print(f"\n示例数据:")
-            for i, item in enumerate(data[:2]):
-                print(f"\n示例 {i+1}:")
-                print(f"  问题: {item.get('question', '')[:150]}...")
-                print(f"  答案: {item.get('answer', '')[:150]}...")
-
-        except Exception as e:
-            print(f"分析文件 {filename} 时出错: {e}")
 
 
 if __name__ == "__main__":
@@ -517,16 +473,17 @@ if __name__ == "__main__":
         choice = input("请输入选择 (1/2/3): ").strip()
 
         if choice == "1":
-            analyze_gsm8k_data()
+            # analyze_gsm8k_data()
+            pass
         elif choice == "2":
             test_dataset_processing()
         elif choice == "3":
-            analyze_gsm8k_data()
+            # analyze_gsm8k_data()
             print("\n" + "="*60 + "\n")
             test_dataset_processing()
         else:
             print("无效选择，运行所有测试...")
-            analyze_gsm8k_data()
+            # analyze_gsm8k_data()
             print("\n" + "="*60 + "\n")
             test_dataset_processing()
 
